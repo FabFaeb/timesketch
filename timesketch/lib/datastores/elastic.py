@@ -24,6 +24,7 @@ from uuid import uuid4
 
 import six
 
+from dateutil import parser, relativedelta
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import ConnectionTimeout
 from elasticsearch.exceptions import NotFoundError
@@ -38,12 +39,16 @@ from timesketch.lib.definitions import HTTP_STATUS_CODE_NOT_FOUND
 es_logger = logging.getLogger('timesketch.elasticsearch')
 es_logger.setLevel(logging.WARNING)
 
-ADD_LABEL_SCRIPT = """
+UPDATE_LABEL_SCRIPT = """
 if (ctx._source.timesketch_label == null) {
     ctx._source.timesketch_label = new ArrayList()
 }
-if( ! ctx._source.timesketch_label.contains (params.timesketch_label)) {
-    ctx._source.timesketch_label.add(params.timesketch_label)
+if (params.remove == true) {
+    ctx._source.timesketch_label.removeIf(label -> label.name == params.timesketch_label.name && label.sketch_id == params.timesketch_label.sketch_id);
+} else {
+    if( ! ctx._source.timesketch_label.contains (params.timesketch_label)) {
+        ctx._source.timesketch_label.add(params.timesketch_label)
+    }
 }
 """
 
@@ -51,14 +56,8 @@ TOGGLE_LABEL_SCRIPT = """
 if (ctx._source.timesketch_label == null) {
     ctx._source.timesketch_label = new ArrayList()
 }
-if(ctx._source.timesketch_label.contains(params.timesketch_label)) {
-    for (int i = 0; i < ctx._source.timesketch_label.size(); i++) {
-      if (ctx._source.timesketch_label[i] == params.timesketch_label) {
-        ctx._source.timesketch_label.remove(i)
-      }
-      i++;
-    }
-} else {
+boolean removedLabel = ctx._source.timesketch_label.removeIf(label -> label.name == params.timesketch_label.name && label.sketch_id == params.timesketch_label.sketch_id);
+if (!removedLabel) {
     ctx._source.timesketch_label.add(params.timesketch_label)
 }
 """
@@ -95,8 +94,7 @@ class ElasticsearchDataStore(object):
         """
         label_query = {
             'bool': {
-                'should': [],
-                'minimum_should_match': 1
+                'must': []
             }
         }
 
@@ -107,7 +105,7 @@ class ElasticsearchDataStore(object):
                         'bool': {
                             'must': [{
                                 'term': {
-                                    'timesketch_label.name': label
+                                    'timesketch_label.name.keyword': label
                                 }
                             }, {
                                 'term': {
@@ -119,7 +117,7 @@ class ElasticsearchDataStore(object):
                     'path': 'timesketch_label'
                 }
             }
-            label_query['bool']['should'].append(nested_query)
+            label_query['bool']['must'].append(nested_query)
         return label_query
 
     @staticmethod
@@ -135,6 +133,50 @@ class ElasticsearchDataStore(object):
         events_list = [event['event_id'] for event in events]
         query_dict = {'query': {'ids': {'values': events_list}}}
         return query_dict
+
+    @staticmethod
+    def _convert_to_time_range(interval):
+        """Convert an interval timestamp into start and end dates.
+
+        Args:
+            interval: Time frame representation
+
+        Returns:
+            Start timestamp in string format.
+            End timestamp in string format.
+        """
+        # return ('2018-12-05T00:00:00', '2018-12-05T23:59:59')
+        TS_FORMAT = '%Y-%m-%dT%H:%M:%S'
+        get_digits = lambda s: int(''.join(filter(str.isdigit, s)))
+        get_alpha = lambda s: ''.join(filter(str.isalpha, s))
+
+        ts_parts = interval.split(' ')
+        # The start date could be 1 or 2 first items
+        start = ' '.join(ts_parts[0:len(ts_parts)-2])
+        minus = get_digits(ts_parts[-2])
+        plus = get_digits(ts_parts[-1])
+        interval = get_alpha(ts_parts[-1])
+
+        start_ts = parser.parse(start)
+
+        rd = relativedelta.relativedelta
+        if interval == 's':
+            start_range = start_ts - rd(seconds=minus)
+            end_range = start_ts + rd(seconds=plus)
+        elif interval == 'm':
+            start_range = start_ts - rd(minutes=minus)
+            end_range = start_ts + rd(minutes=plus)
+        elif interval == 'h':
+            start_range = start_ts - rd(hours=minus)
+            end_range = start_ts + rd(hours=plus)
+        elif interval == 'd':
+            start_range = start_ts - rd(days=minus)
+            end_range = start_ts + rd(days=plus)
+        else:
+            raise RuntimeError('Unable to parse the timestamp: '
+                               + str(interval))
+
+        return start_range.strftime(TS_FORMAT), end_range.strftime(TS_FORMAT)
 
     def build_query(self, sketch_id, query_string, query_filter, query_dsl=None,
                     aggregations=None):
@@ -152,7 +194,8 @@ class ElasticsearchDataStore(object):
         """
 
         if query_dsl:
-            query_dsl = json.loads(query_dsl)
+            if not isinstance(query_dsl, dict):
+                query_dsl = json.loads(query_dsl)
             # Remove any aggregation coming from user supplied Query DSL.
             # We have no way to display this data in a good way today.
             if query_dsl.get('aggregations', None):
@@ -233,10 +276,8 @@ class ElasticsearchDataStore(object):
                     elif chip['operator'] == 'must_not':
                         must_not_filters.append(term_filter)
 
-                elif chip['type'] == 'datetime_range':
-                    start = chip['value'].split(',')[0]
-                    end = chip['value'].split(',')[1]
-                    range_filter = {
+                elif chip['type'].startswith('datetime'):
+                    range_filter = lambda start, end: {
                         'range': {
                             'datetime': {
                                 'gte': start,
@@ -244,7 +285,14 @@ class ElasticsearchDataStore(object):
                             }
                         }
                     }
-                    datetime_ranges['bool']['should'].append(range_filter)
+                    if chip['type'] == 'datetime_range':
+                        start, end = chip['value'].split(',')
+                    elif chip['type'] == 'datetime_interval':
+                        start, end = self._convert_to_time_range(chip['value'])
+                    else:
+                        continue
+                    datetime_ranges['bool']['should'].append(
+                        range_filter(start, end))
 
             label_filter = self._build_labels_query(sketch_id, labels)
             must_filters.append(label_filter)
@@ -340,20 +388,37 @@ class ElasticsearchDataStore(object):
         # The argument " _source_include" changed to "_source_includes" in
         # ES version 7. This check add support for both version 6 and 7 clients.
         # pylint: disable=unexpected-keyword-arg
-        if self.version.startswith('6'):
-            _search_result = self.client.search(
-                body=query_dsl,
-                index=list(indices),
-                search_type=search_type,
-                _source_include=return_fields,
-                scroll=scroll_timeout)
-        else:
-            _search_result = self.client.search(
-                body=query_dsl,
-                index=list(indices),
-                search_type=search_type,
-                _source_includes=return_fields,
-                scroll=scroll_timeout)
+        try:
+            if self.version.startswith('6'):
+                _search_result = self.client.search(
+                    body=query_dsl,
+                    index=list(indices),
+                    search_type=search_type,
+                    _source_include=return_fields,
+                    scroll=scroll_timeout)
+            else:
+                _search_result = self.client.search(
+                    body=query_dsl,
+                    index=list(indices),
+                    search_type=search_type,
+                    _source_includes=return_fields,
+                    scroll=scroll_timeout)
+        except RequestError as e:
+            root_cause = e.info.get('error', {}).get('root_cause')
+            if root_cause:
+                error_items = []
+                for cause in root_cause:
+                    error_items.append(
+                        '[{0:s}] {1:s}'.format(
+                            cause.get('type', ''), cause.get('reason', '')))
+                cause = ', '.join(error_items)
+            else:
+                cause = str(e)
+
+            es_logger.error(
+                'Unable to run search query: {0:s}'.format(cause),
+                exc_info=True)
+            raise ValueError(cause)
 
         return _search_result
 
@@ -415,6 +480,67 @@ class ElasticsearchDataStore(object):
             for event in result['hits']['hits']:
                 yield event
 
+    def get_filter_labels(self, sketch_id, indices):
+        """Aggregate labels for a sketch.
+
+        Args:
+            sketch_id: The Sketch ID
+            indices: List of indices to aggregate on
+
+        Returns:
+            List with label names.
+        """
+        # This is a workaround to return all labels by setting the max buckets
+        # to something big. If a sketch has more than this amount of labels
+        # the list will be incomplete but it should be uncommon to have >10k
+        # labels in a sketch.
+        max_labels = 10000
+
+        # pylint: disable=line-too-long
+        aggregation = {
+            'aggs': {
+                'nested': {
+                    'nested': {
+                        'path': 'timesketch_label'
+                    },
+                    'aggs': {
+                        'inner': {
+                            'filter': {
+                                'bool': {
+                                    'must': [{
+                                        'term': {
+                                            'timesketch_label.sketch_id': sketch_id
+                                        }
+                                    }]
+                                }
+                            },
+                            'aggs': {
+                                'labels': {
+                                    'terms': {
+                                        'size': max_labels,
+                                        'field': 'timesketch_label.name.keyword'
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        labels = []
+        # pylint: disable=unexpected-keyword-arg
+        result = self.client.search(index=indices, body=aggregation, size=0)
+        buckets = result.get(
+            'aggregations', {}).get('nested', {}).get('inner', {}).get(
+                'labels', {}).get('buckets', [])
+        for bucket in buckets:
+            # Filter out special labels like __ts_star etc.
+            if bucket['key'].startswith('__'):
+                continue
+            labels.append(bucket['key'])
+        return labels
+
     def get_event(self, searchindex_id, event_id):
         """Get one event from the datastore.
 
@@ -468,7 +594,8 @@ class ElasticsearchDataStore(object):
         return result.get('count', 0)
 
     def set_label(self, searchindex_id, event_id, event_type, sketch_id,
-                  user_id, label, toggle=False, single_update=True):
+                  user_id, label, toggle=False, remove=False,
+                  single_update=True):
         """Set label on event in the datastore.
 
         Args:
@@ -478,9 +605,9 @@ class ElasticsearchDataStore(object):
             sketch_id: Integer of sketch primary key
             user_id: Integer of user primary key
             label: String with the name of the label
+            remove: Optional boolean value if the label should be removed
             toggle: Optional boolean value if the label should be toggled
             single_update: Boolean if the label should be indexed immediately.
-            (add/remove). The default is False.
 
         Returns:
             Dict with updated document body, or None if this is a single update.
@@ -489,13 +616,14 @@ class ElasticsearchDataStore(object):
         update_body = {
             'script': {
                 'lang': 'painless',
-                'source': ADD_LABEL_SCRIPT,
+                'source': UPDATE_LABEL_SCRIPT,
                 'params': {
                     'timesketch_label': {
                         'name': str(label),
                         'user_id': user_id,
                         'sketch_id': sketch_id
-                    }
+                    },
+                    remove: remove
                 }
             }
         }

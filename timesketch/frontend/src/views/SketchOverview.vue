@@ -32,6 +32,8 @@ limitations under the License.
       <div class="container is-fluid">
         <ts-navbar-secondary currentAppContext="sketch" currentPage="overview">
 
+          <span v-for="label in meta.sketch_labels" :key="label" style="margin-right:10px; color: var(--default-font-color);font-size: 0.7em">{{  label }}</span>
+
           <b-tooltip v-if="meta.collaborators" :label="shareTooltip" position="is-bottom" type="is-white">
             <a v-if="meta.permissions.write" class="button is-info is-rounded" style="margin-right:10px;" v-on:click="showShareModal = !showShareModal">
                 <span class="icon is-small">
@@ -222,6 +224,17 @@ limitations under the License.
             <div class="card has-min-height">
               <header class="card-header">
                 <p class="card-header-title">Stories</p>
+                <div class="field is-grouped is-pulled-right" style="padding: 0.75rem;">
+                  <p class="control">
+                    <router-link class="button is-rounded is-small" :to="{ name: 'SketchStoryOverview' }">
+                      <span class="icon is-small">
+                        <i class="fas fa-cog"></i>
+                      </span>
+                      <span>Manage</span>
+                    </router-link>
+                  </p>
+                </div>
+
               </header>
               <div class="card-content" style="padding:5px;">
                 <ts-sketch-story-list :controls="false"></ts-sketch-story-list>
@@ -395,4 +408,6 @@ export default {
     justify-content: center;
     align-items: center;
   }
+
+
 </style>
